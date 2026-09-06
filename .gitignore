@@ -1,0 +1,10 @@
+venv/
+venv-training/
+__pycache__/
+*.pyc
+stockfish/
+stockfish-macos-x86-64-bmi2.tar
+lichess_db_standard_rated_*.pgn.zst
+training_positions.csv
+value_network.pt
+.DS_Store
