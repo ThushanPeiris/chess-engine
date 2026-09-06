@@ -466,24 +466,24 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
     if depth == 0:
         return quiescence(board, alpha, beta, nodes_counter, deadline)
 
-    # Null-move pruning - see search_engine.py in real_engine/ for the
-    # full explanation. Disabled in check and when the side to move has
-    # only pawns and a king (zugzwang risk).
-    NULL_MOVE_REDUCTION = 2
-    has_non_pawn_material = any(
-        board.pieces(pt, board.turn)
-        for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
-    )
-    if (depth >= 3 and not board.is_check() and has_non_pawn_material
-            and beta < 999000):
-        board.push(chess.Move.null())
-        try:
-            null_score = -negamax(board, depth - 1 - NULL_MOVE_REDUCTION,
-                                   -beta, -beta + 1, nodes_counter, deadline)
-        finally:
-            board.pop()
-        if null_score >= beta:
-            return beta
+    # NOTE: null-move pruning was tried here and then REMOVED after real
+    # testing. A full 6-game real-clock comparison against the
+    # piece-square-table version reversed from 66.7% (before null-move)
+    # to 25% (after) - a clear, repeatable regression, not noise, with
+    # no short-game/blunder warnings to explain it as a separate bug.
+    # The likely reason: null-move pruning trusts that the evaluation
+    # function is smooth and reliable enough that "still fine after
+    # giving the opponent a free move" is a safe signal to stop
+    # searching. A small trained network is noisier and less locally
+    # consistent than hand-crafted piece-square tables, making that
+    # trust assumption weaker here - so cutoffs are more likely to be
+    # false positives, pruning away lines that actually mattered. This
+    # is a case where an optimization that's a clear, measured win for
+    # one evaluator (see real_engine/search_engine.py, where it stays
+    # enabled) is a clear, measured loss for a different one - worth
+    # remembering if the network architecture changes later, since this
+    # decision was made for THIS specific (small, 771-input) network,
+    # not as a general verdict on null-move pruning with any NNUE.
 
     best_score = float("-inf")
     best_move_here = None

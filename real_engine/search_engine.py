@@ -1,57 +1,46 @@
 import chess
 import chess.polyglot
-import numpy as np
-import onnxruntime as ort
-import math
 import time
 
 # ============================================================
-# TRAINED NETWORK (replaces the piece-square-table evaluation)
+# EVALUATION
 # ============================================================
-# Loaded ONCE at module import, not inside evaluate() - matches the
-# competition's documented model, since import time is covered by the
-# 90s init budget, separate from the per-move match clock. Loading it
-# inside evaluate() would reload the model on every single call, which
-# would be both slow and wrong.
+# Two upgrades from the pure-material version:
 #
-# onnxruntime is used for inference rather than torch directly: it's
-# generally faster for pure inference and has a much smaller runtime
-# footprint, which matters when every millisecond of the per-move
-# time budget counts.
+# 1. Piece-square tables (PST): a bonus/penalty added to each piece's
+#    value depending on which square it sits on. This is what actually
+#    fixes the "Nh3" problem you saw - pure material counting can't tell
+#    a good developing move from a bad one (no material changes either
+#    way), but PSTs directly encode "knights are worth more in the
+#    center, less on the rim" as a numeric bonus. This is standard,
+#    well-established chess programming knowledge (the widely-used
+#    "Simplified Evaluation Function" tables, originally by Tomasz
+#    Michniewski, documented on the Chess Programming Wiki) - these are
+#    plain numeric lookup tables, not anyone's creative writing, and
+#    they're explicitly published for engine builders to use directly.
+#
+# 2. This is STILL a placeholder for the eventual NNUE net - PSTs are a
+#    well-known intermediate step, better than pure material but far
+#    less accurate than a trained network. Once your net is ready, this
+#    whole evaluate() function gets replaced by a call into the model;
+#    nothing else in the search needs to change.
 
-NNUE_MODEL_PATH = "value_network.onnx"
-
-try:
-    _nnue_session = ort.InferenceSession(NNUE_MODEL_PATH)
-except Exception as e:
-    raise RuntimeError(
-        f"Failed to load NNUE model from '{NNUE_MODEL_PATH}' - this must "
-        f"succeed at import time, since a failure here would otherwise "
-        f"only surface on the first real move of a match. Original "
-        f"error: {e}"
-    )
-
-# Must exactly match the encoding used in train_network.py's
-# fen_to_features - any mismatch here would silently feed the network
-# garbage input it was never trained on, without necessarily crashing.
-_PIECE_TO_INDEX = {
-    (chess.PAWN, chess.WHITE): 0, (chess.KNIGHT, chess.WHITE): 1,
-    (chess.BISHOP, chess.WHITE): 2, (chess.ROOK, chess.WHITE): 3,
-    (chess.QUEEN, chess.WHITE): 4, (chess.KING, chess.WHITE): 5,
-    (chess.PAWN, chess.BLACK): 6, (chess.KNIGHT, chess.BLACK): 7,
-    (chess.BISHOP, chess.BLACK): 8, (chess.ROOK, chess.BLACK): 9,
-    (chess.QUEEN, chess.BLACK): 10, (chess.KING, chess.BLACK): 11,
+PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+    chess.KING: 0,
 }
 
-# Engineered features (material balance, PST score) - must exactly match
-# train_network.py's PIECE_VALUES and piece-square tables, since these
-# feed the network as extra inputs alongside raw board placement.
-_PIECE_VALUES = {
-    chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
-    chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
-}
+# Each table is written from White's point of view, with index 0 = a8
+# (top-left when White is at the bottom) and index 63 = h1, matching
+# python-chess's square numbering (a1=0 ... h8=63) when read bottom-to-top.
+# To keep this readable, tables below are written top-to-bottom as you'd
+# see the board from White's side, then flipped in code.
 
-_PAWN_TABLE = [
+PAWN_TABLE = [
      0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
     10, 10, 20, 30, 30, 20, 10, 10,
@@ -61,7 +50,8 @@ _PAWN_TABLE = [
      5, 10, 10,-20,-20, 10, 10,  5,
      0,  0,  0,  0,  0,  0,  0,  0,
 ]
-_KNIGHT_TABLE = [
+
+KNIGHT_TABLE = [
     -50,-40,-30,-30,-30,-30,-40,-50,
     -40,-20,  0,  0,  0,  0,-20,-40,
     -30,  0, 10, 15, 15, 10,  0,-30,
@@ -71,7 +61,8 @@ _KNIGHT_TABLE = [
     -40,-20,  0,  5,  5,  0,-20,-40,
     -50,-40,-30,-30,-30,-30,-40,-50,
 ]
-_BISHOP_TABLE = [
+
+BISHOP_TABLE = [
     -20,-10,-10,-10,-10,-10,-10,-20,
     -10,  0,  0,  0,  0,  0,  0,-10,
     -10,  0,  5, 10, 10,  5,  0,-10,
@@ -81,7 +72,8 @@ _BISHOP_TABLE = [
     -10,  5,  0,  0,  0,  0,  5,-10,
     -20,-10,-10,-10,-10,-10,-10,-20,
 ]
-_ROOK_TABLE = [
+
+ROOK_TABLE = [
      0,  0,  0,  0,  0,  0,  0,  0,
      5, 10, 10, 10, 10, 10, 10,  5,
     -5,  0,  0,  0,  0,  0,  0, -5,
@@ -91,7 +83,8 @@ _ROOK_TABLE = [
     -5,  0,  0,  0,  0,  0,  0, -5,
      0,  0,  0,  5,  5,  0,  0,  0,
 ]
-_QUEEN_TABLE = [
+
+QUEEN_TABLE = [
     -20,-10,-10, -5, -5,-10,-10,-20,
     -10,  0,  0,  0,  0,  0,  0,-10,
     -10,  0,  5,  5,  5,  5,  0,-10,
@@ -101,7 +94,8 @@ _QUEEN_TABLE = [
     -10,  0,  5,  0,  0,  0,  0,-10,
     -20,-10,-10, -5, -5,-10,-10,-20,
 ]
-_KING_TABLE = [
+
+KING_TABLE = [
     -30,-40,-40,-50,-50,-40,-40,-30,
     -30,-40,-40,-50,-50,-40,-40,-30,
     -30,-40,-40,-50,-50,-40,-40,-30,
@@ -111,15 +105,30 @@ _KING_TABLE = [
      20, 20,  0,  0,  0,  0, 20, 20,
      20, 30, 10,  0,  0, 10, 30, 20,
 ]
-_PIECE_SQUARE_TABLES = {
-    chess.PAWN: _PAWN_TABLE, chess.KNIGHT: _KNIGHT_TABLE, chess.BISHOP: _BISHOP_TABLE,
-    chess.ROOK: _ROOK_TABLE, chess.QUEEN: _QUEEN_TABLE, chess.KING: _KING_TABLE,
+
+PIECE_SQUARE_TABLES = {
+    chess.PAWN: PAWN_TABLE,
+    chess.KNIGHT: KNIGHT_TABLE,
+    chess.BISHOP: BISHOP_TABLE,
+    chess.ROOK: ROOK_TABLE,
+    chess.QUEEN: QUEEN_TABLE,
+    chess.KING: KING_TABLE,
 }
 
 
 def _pst_value(piece_type: int, square: int, is_white: bool) -> int:
-    table = _PIECE_SQUARE_TABLES[piece_type]
+    """
+    Looks up a piece-square bonus. The tables above are written from
+    White's perspective (rank 8 first). python-chess squares are
+    numbered a1=0 through h8=63, so for White we need to read the table
+    "upside down" relative to how it's written, and for Black we mirror
+    the square vertically (rank 1 becomes rank 8, etc.) since the tables
+    are symmetric between the two sides.
+    """
+    table = PIECE_SQUARE_TABLES[piece_type]
     if is_white:
+        # square 0 (a1) should read the table's LAST row (index 56-63),
+        # square 63 (h8) should read the table's FIRST row (index 0-7).
         row = 7 - (square // 8)
         col = square % 8
     else:
@@ -128,67 +137,10 @@ def _pst_value(piece_type: int, square: int, is_white: bool) -> int:
     return table[row * 8 + col]
 
 
-def _compute_engineered_features(board: chess.Board):
-    """Must exactly match train_network.py's compute_engineered_features."""
-    material = 0
-    pst = 0
-    for piece_type, value in _PIECE_VALUES.items():
-        for square in board.pieces(piece_type, chess.WHITE):
-            material += value
-            pst += _pst_value(piece_type, square, is_white=True)
-        for square in board.pieces(piece_type, chess.BLACK):
-            material -= value
-            pst -= _pst_value(piece_type, square, is_white=False)
-
-    if board.turn == chess.BLACK:
-        material = -material
-        pst = -pst
-
-    return material / 3000.0, pst / 200.0
-
-
-def _board_to_nnue_features(board: chess.Board) -> np.ndarray:
-    """
-    771 features: 12 piece types x 64 squares (one-hot) + 1 side-to-move
-    flag + 2 engineered features (material balance, PST score). Must be
-    identical to train_network.py's encoding - this is duplicated rather
-    than imported because the competition environment won't have
-    train_network.py available, only whatever ships in agent.zip.
-    """
-    features = np.zeros(771, dtype=np.float32)
-    for square, piece in board.piece_map().items():
-        idx = _PIECE_TO_INDEX[(piece.piece_type, piece.color)]
-        features[idx * 64 + square] = 1.0
-    features[768] = 1.0 if board.turn == chess.WHITE else 0.0
-
-    material_normalized, pst_normalized = _compute_engineered_features(board)
-    features[769] = material_normalized
-    features[770] = pst_normalized
-
-    return features
-
-
 def evaluate(board: chess.Board) -> int:
     """
-    Trained-network evaluation, replacing the piece-square-table version.
-    Returns a centipawn-EQUIVALENT score from the perspective of the side
-    to move - same convention as before, so nothing else in the search
-    (alpha-beta bounds, mate sentinels, quiescence stand-pat) needs to
-    change.
-
-    The network outputs a WDL (win probability) in [0, 1], since that's
-    what it was trained to predict (see train_network.py). We convert
-    that back to a centipawn-equivalent number via the inverse of the
-    same sigmoid transform used to build the training targets, purely so
-    the output stays on a familiar, debuggable scale and stays safely
-    far below the -999999 checkmate sentinel used elsewhere in the
-    search.
-
-    Terminal positions (checkmate/stalemate/insufficient material) are
-    still special-cased directly rather than left to the network - this
-    matches standard practice: exact game-over conditions are cheap and
-    unambiguous to compute directly, and there's no reason to trust a
-    learned approximation for something known with certainty.
+    Material + piece-square tables, from the perspective of the side to
+    move (negamax convention - see the search section below).
     """
     if board.is_checkmate():
         return -999999
@@ -196,28 +148,15 @@ def evaluate(board: chess.Board) -> int:
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
 
-    features = _board_to_nnue_features(board).reshape(1, -1)
-    wdl = _nnue_session.run(None, {"board_features": features})[0][0][0]
+    score = 0
+    for piece_type, value in PIECE_VALUES.items():
+        for square in board.pieces(piece_type, chess.WHITE):
+            score += value + _pst_value(piece_type, square, is_white=True)
+        for square in board.pieces(piece_type, chess.BLACK):
+            score -= value + _pst_value(piece_type, square, is_white=False)
 
-    # Clip away from the exact 0/1 boundary before the inverse-sigmoid
-    # log, which would otherwise divide by zero or take log(0) at the
-    # extremes.
-    wdl = min(max(float(wdl), 1e-6), 1 - 1e-6)
-    cp_equivalent = -400.0 * math.log10(1.0 / wdl - 1.0)
+    return score if board.turn == chess.WHITE else -score
 
-    return int(cp_equivalent)
-
-
-# Still needed for MVV-LVA move ordering (captures ranked by piece
-# value), even though it's no longer used inside evaluate() itself.
-PIECE_VALUES = {
-    chess.PAWN: 100,
-    chess.KNIGHT: 320,
-    chess.BISHOP: 330,
-    chess.ROOK: 500,
-    chess.QUEEN: 900,
-    chess.KING: 0,
-}
 
 # ============================================================
 # MOVE ORDERING
@@ -466,16 +405,29 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
     if depth == 0:
         return quiescence(board, alpha, beta, nodes_counter, deadline)
 
-    # Null-move pruning - see search_engine.py in real_engine/ for the
-    # full explanation. Disabled in check and when the side to move has
-    # only pawns and a king (zugzwang risk).
-    NULL_MOVE_REDUCTION = 2
+    # ============================================================
+    # NULL-MOVE PRUNING
+    # ============================================================
+    # Idea: if we "pass" (give the opponent a free move) and we're STILL
+    # doing fine even after that, our actual position must be strong
+    # enough that we don't need to search it deeply - we can cut here.
+    # This is a real, well-established Elo gain, but it has one classic
+    # failure mode: in zugzwang positions (mainly certain endgames),
+    # having to move is actually a disadvantage - "passing" would be
+    # BETTER than any real move available, so the null-move assumption
+    # (passing tells us about our worst case) is backwards. The standard
+    # safeguard is to disable null-move pruning whenever the side to
+    # move has only pawns and a king left (no minor/major pieces) -
+    # exactly the material profile where zugzwang is common - and to
+    # never use it while in check (a "free" move can't be given there
+    # regardless).
+    NULL_MOVE_REDUCTION = 2  # search the resulting position 2 ply shallower
     has_non_pawn_material = any(
         board.pieces(pt, board.turn)
         for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
     )
     if (depth >= 3 and not board.is_check() and has_non_pawn_material
-            and beta < 999000):
+            and beta < 999000):  # skip near mate scores, where pruning is unsafe
         board.push(chess.Move.null())
         try:
             null_score = -negamax(board, depth - 1 - NULL_MOVE_REDUCTION,
@@ -483,7 +435,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
         finally:
             board.pop()
         if null_score >= beta:
-            return beta
+            return beta  # even giving the opponent a free move, we're still fine here
 
     best_score = float("-inf")
     best_move_here = None

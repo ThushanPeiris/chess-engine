@@ -466,24 +466,6 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
     if depth == 0:
         return quiescence(board, alpha, beta, nodes_counter, deadline)
 
-    # Null-move pruning - see search_engine.py in real_engine/ for the
-    # full explanation. Disabled in check and when the side to move has
-    # only pawns and a king (zugzwang risk).
-    NULL_MOVE_REDUCTION = 2
-    has_non_pawn_material = any(
-        board.pieces(pt, board.turn)
-        for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
-    )
-    if (depth >= 3 and not board.is_check() and has_non_pawn_material
-            and beta < 999000):
-        board.push(chess.Move.null())
-        try:
-            null_score = -negamax(board, depth - 1 - NULL_MOVE_REDUCTION,
-                                   -beta, -beta + 1, nodes_counter, deadline)
-        finally:
-            board.pop()
-        if null_score >= beta:
-            return beta
 
     best_score = float("-inf")
     best_move_here = None
