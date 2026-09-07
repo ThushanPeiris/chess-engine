@@ -228,6 +228,46 @@ transposition_table = {}
 
 
 # ============================================================
+# REPETITION TRACKING
+# ============================================================
+# The wire protocol only ever gives us the current FEN, never move
+# history - so nothing in the engine knows a position has been seen
+# before unless we track it ourselves. The competition docs say this
+# explicitly: "the referee claims threefold and fifty-move draws
+# automatically, so an agent that wants to avoid a repetition tracks
+# the positions it has been asked about." Real ladder games showed this
+# mattering: 2 of the first 4 rated games ended in threefold repetition,
+# and without any awareness of this, the engine could easily walk into
+# a repetition draw even while genuinely ahead, simply because nothing
+# in the search knew to avoid it.
+#
+# This dict persists for the whole process (one game, per the
+# documented process model - same lifetime as transposition_table
+# above) and counts how many times each position has actually occurred
+# in the real game so far. During search, the SAME dict is temporarily
+# incremented/decremented as the search explores hypothetical
+# continuations - this is deliberate: it lets the search ask "if this
+# exact line were actually played out, would this position become a
+# real third occurrence?" by combining real game history with the
+# hypothetical line currently being explored, which is the standard,
+# correct technique for this.
+game_position_history = {}
+
+
+def record_real_position(board: chess.Board) -> None:
+    """
+    Call exactly once per REAL position the engine is asked to move
+    from (and once more for the position immediately after its own
+    chosen move) - never for a purely hypothetical position explored
+    during search. This is a permanent increment for the rest of the
+    game, unlike the temporary push/pop bookkeeping used inside the
+    search itself.
+    """
+    key = chess.polyglot.zobrist_hash(board)
+    game_position_history[key] = game_position_history.get(key, 0) + 1
+
+
+# ============================================================
 # TIME MANAGEMENT
 # ============================================================
 # Two separate problems, both handled here:
@@ -327,6 +367,14 @@ def quiescence(board: chess.Board, alpha: int, beta: int, nodes_counter: list, d
     if nodes_counter[0] % TIME_CHECK_INTERVAL == 0 and time.time() >= deadline:
         raise SearchTimeout()
 
+    # A perpetual-check pattern (a classic real-game draw) is exactly
+    # the kind of thing quiescence search walks through, since checks
+    # are treated as noisy moves - so this position needs the same
+    # repetition check as negamax, not just the main search.
+    zobrist_key = chess.polyglot.zobrist_hash(board)
+    if game_position_history.get(zobrist_key, 0) >= 3:
+        return 0
+
     if board.is_checkmate():
         return -999999 - (QUIESCENCE_MAX_DEPTH - depth)
 
@@ -348,9 +396,14 @@ def quiescence(board: chess.Board, alpha: int, beta: int, nodes_counter: list, d
 
     for move in noisy_moves:
         board.push(move)
+        child_key = chess.polyglot.zobrist_hash(board)
+        game_position_history[child_key] = game_position_history.get(child_key, 0) + 1
         try:
             score = -quiescence(board, -beta, -alpha, nodes_counter, deadline, depth + 1)
         finally:
+            game_position_history[child_key] -= 1
+            if game_position_history[child_key] == 0:
+                del game_position_history[child_key]
             board.pop()
 
         if score >= beta:
@@ -382,6 +435,15 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
     original_alpha = alpha
 
     zobrist_key = chess.polyglot.zobrist_hash(board)
+
+    # Checked BEFORE the transposition table lookup below: a cached
+    # score for this position was computed with no awareness of the
+    # specific path taken to reach it this time, so it can't be trusted
+    # to reflect that THIS path makes it a real third occurrence. A
+    # repetition draw always overrides whatever the table says.
+    if game_position_history.get(zobrist_key, 0) >= 3:
+        return 0
+
     tt_entry = transposition_table.get(zobrist_key)
     tt_move = None
     if tt_entry is not None:
@@ -444,9 +506,14 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, nodes_counter
 
     for move in moves:
         board.push(move)
+        child_key = chess.polyglot.zobrist_hash(board)
+        game_position_history[child_key] = game_position_history.get(child_key, 0) + 1
         try:
             score = -negamax(board, depth - 1, -beta, -alpha, nodes_counter, deadline)
         finally:
+            game_position_history[child_key] -= 1
+            if game_position_history[child_key] == 0:
+                del game_position_history[child_key]
             board.pop()
 
         if score > best_score:
@@ -502,9 +569,14 @@ def find_best_move(board: chess.Board, depth: int, deadline: float) -> SearchRes
 
     for move in moves:
         board.push(move)
+        child_key = chess.polyglot.zobrist_hash(board)
+        game_position_history[child_key] = game_position_history.get(child_key, 0) + 1
         try:
             score = -negamax(board, depth - 1, -beta, -alpha, nodes_counter, deadline)
         finally:
+            game_position_history[child_key] -= 1
+            if game_position_history[child_key] == 0:
+                del game_position_history[child_key]
             board.pop()
 
         if score > best_score:

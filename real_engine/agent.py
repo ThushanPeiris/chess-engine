@@ -18,7 +18,7 @@ an outdated read of the rules. Nothing here attempts it.
 """
 
 import chess
-from search_engine import iterative_deepening_search, allocate_time
+from search_engine import iterative_deepening_search, allocate_time, record_real_position
 
 # Fixed by the competition's published time control (120s + 0.5s/move).
 # If this ever changes, it's the one constant to update.
@@ -51,6 +51,15 @@ def get_move(fen: str, time_left_ms: int) -> str:
     """
     board = chess.Board(fen)
 
+    # Record this as a REAL position that has actually occurred in the
+    # game - this is what lets the search recognise, on later moves,
+    # that repeating it would create a genuine threefold repetition.
+    # See search_engine.py's REPETITION TRACKING section for the full
+    # reasoning; this call is deliberately outside the try/except below,
+    # since even if search fails and we fall back to a safe move, this
+    # position genuinely did occur and should still be recorded.
+    record_real_position(board)
+
     try:
         remaining_seconds = time_left_ms / 1000.0
         ply_count = _estimate_ply_count(fen)
@@ -59,6 +68,12 @@ def get_move(fen: str, time_left_ms: int) -> str:
         result = iterative_deepening_search(board, time_budget)
 
         if result is not None and result.best_move is not None:
+            # Also record the position immediately after our own chosen
+            # move - together with the FEN we're given each of our own
+            # turns, this tracks essentially every ply of the real game
+            # from here onward, not just every other one.
+            board.push(result.best_move)
+            record_real_position(board)
             return result.best_move.uci()
     except Exception:
         # Any unexpected failure in search must NOT crash the process -
@@ -72,4 +87,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # or a malformed string. A mediocre move can lose a game eventually;
     # a crash or illegal-move forfeit loses it immediately.
     legal_moves = list(board.legal_moves)
-    return legal_moves[0].uci()
+    fallback_move = legal_moves[0]
+    board.push(fallback_move)
+    record_real_position(board)
+    return fallback_move.uci()
